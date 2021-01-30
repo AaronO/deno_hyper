@@ -4,6 +4,6 @@ globalThis.handler = async ({ url }) => {
   return {
     status: 200,
     headers: { "content-type": "text/plain" },
-    body: [body],
+    body,
   };
 };
