@@ -47,7 +47,7 @@ pub type RequestAndResponse = (Request<Body>, oneshot::Sender<Response<Body>>);
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), AnyError> {
   let mut js_runtime = create_js_runtime();
-  let (tx, rx) = mpsc::unbounded_channel::<RequestAndResponse>();
+  let (tx, rx) = mpsc::channel::<RequestAndResponse>(1);
   let op_state = js_runtime.op_state();
   let rx = Rc::new(RefCell::new(rx));
   op_state.borrow_mut().put(rx);
@@ -67,7 +67,7 @@ async fn main() -> Result<(), AnyError> {
           let tx = tx.clone();
           async move {
             let (resp_tx, resp_rx) = oneshot::channel();
-            tx.send((req, resp_tx)).unwrap();
+            tx.send((req, resp_tx)).await.unwrap();
             let resp = resp_rx.await.unwrap();
             Ok::<Response<Body>, Infallible>(resp)
           }
@@ -111,7 +111,7 @@ pub async fn op_next_request(
 ) -> Result<Value, AnyError> {
   let rx = state
     .borrow()
-    .borrow::<Rc<RefCell<mpsc::UnboundedReceiver<RequestAndResponse>>>>()
+    .borrow::<Rc<RefCell<mpsc::Receiver<RequestAndResponse>>>>()
     .clone();
   let (req, tx) = match rx.borrow_mut().recv().await {
     None => bail!("failed to recieve"),
