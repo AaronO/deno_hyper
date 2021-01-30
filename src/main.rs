@@ -27,6 +27,7 @@ use deno_core::Resource;
 use deno_core::ZeroCopyBuf;
 
 use deno_core::futures::StreamExt;
+use hyper::body::HttpBody;
 use hyper::service::make_service_fn;
 use hyper::service::service_fn;
 use hyper::Body;
@@ -131,23 +132,35 @@ pub async fn op_next_request(
   let path = req.uri().path_and_query().unwrap();
   let url = format!("https://{}{}", host, path);
 
-  let stream: BytesStream = Box::pin(req.into_body().map(|r| {
-    r.map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, err))
-  }));
-  let stream_reader = StreamReader::new(stream);
+  let has_body = if let Some(exact_size) = req.size_hint().exact() {
+    exact_size > 0
+  } else {
+    true
+  };
+
+  let maybe_request_body_rid = if has_body {
+    let stream: BytesStream = Box::pin(req.into_body().map(|r| {
+      r.map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, err))
+    }));
+    let stream_reader = StreamReader::new(stream);
+    let mut state = state.borrow_mut();
+    let request_body_rid = state.resource_table.add(RequestBodyResource {
+      reader: AsyncRefCell::new(stream_reader),
+      cancel: CancelHandle::default(),
+    });
+    Some(request_body_rid)
+  } else {
+    None
+  };
 
   let mut state = state.borrow_mut();
-  let request_body_rid = state.resource_table.add(RequestBodyResource {
-    reader: AsyncRefCell::new(stream_reader),
-    cancel: CancelHandle::default(),
-  });
   let response_sender_rid =
     state.resource_table.add(ResponseSenderResource(tx));
 
   let req_json = json!({
-    "requestBodyRid": request_body_rid,
+    "requestBodyRid": maybe_request_body_rid,
     "responseSenderRid": response_sender_rid,
-    "method": method ,
+    "method": method,
     "headers": headers,
     "url": url,
   });

@@ -14,7 +14,9 @@
     async function handle(req) {
       let { requestBodyRid, responseSenderRid, method, headers, url } = req;
 
-      Deno.core.close(requestBodyRid);
+      if (requestBodyRid) {
+        Deno.core.close(requestBodyRid);
+      }
 
       const resp = await globalThis.handler({ method, headers, url });
 
