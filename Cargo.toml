@@ -1,0 +1,13 @@
+[package]
+name = "dyper_ops"
+version = "0.1.0"
+authors = ["Luca Casonato <lucacasonato@yahoo.com>"]
+edition = "2018"
+
+[dependencies]
+hyper = { version = "0.14", features = ["server", "stream", "http1", "http2", "runtime"] }
+tokio = { version = "1.1", features = ["full"] }
+tokio-util = { version = "0.6", features = ["io"] }
+deno_core = "0.77.1"
+serde = "1.0"
+bytes = "1.0"
