@@ -1,3 +1,5 @@
+use deno_core::v8;
+
 use std::borrow::Cow;
 use std::cell::RefCell;
 use std::convert::Infallible;
@@ -46,6 +48,10 @@ pub type RequestAndResponse = (Request<Body>, oneshot::Sender<Response<Body>>);
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), AnyError> {
+  for arg in std::env::args() {
+    v8::V8::set_flags_from_string(&arg);
+  }
+
   let mut js_runtime = create_js_runtime();
   let (tx, rx) = mpsc::channel::<RequestAndResponse>(1);
   let op_state = js_runtime.op_state();
