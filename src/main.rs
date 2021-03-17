@@ -29,9 +29,16 @@ use deno_core::Resource;
 use deno_core::ZeroCopyBuf;
 
 use deno_core::futures::StreamExt;
+use hyper::http;
+use hyper::http::StatusCode;
+use hyper::server::conn::Http;
+use std::task::Poll;
+use std::task::Context;
+use std::future::Future;
 use hyper::body::HttpBody;
 use hyper::service::make_service_fn;
 use hyper::service::service_fn;
+use hyper::service::Service;
 use hyper::Body;
 use hyper::Request;
 use hyper::Response;
@@ -41,6 +48,7 @@ use tokio::io::AsyncReadExt;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 use tokio_util::io::StreamReader;
+use tokio::net::TcpListener;
 
 const HTTP_ADDR: &str = "127.0.0.1:4000";
 
@@ -64,31 +72,6 @@ async fn main() -> Result<(), AnyError> {
 
   let script = tokio::fs::read_to_string("mod.js").await.unwrap();
   js_runtime.execute("mod.js", &script).unwrap();
-
-  tokio::spawn(async move {
-    let make_svc = make_service_fn(|_| {
-      let tx = tx.clone();
-      async move {
-        Ok::<_, Infallible>(service_fn(move |req: Request<Body>| {
-          let tx = tx.clone();
-          async move {
-            let (resp_tx, resp_rx) = oneshot::channel();
-            tx.send((req, resp_tx)).await.unwrap();
-            let resp = resp_rx.await.unwrap();
-            Ok::<Response<Body>, Infallible>(resp)
-          }
-        }))
-      }
-    });
-
-    let addr = SocketAddr::from_str(HTTP_ADDR).unwrap();
-    let builder = Server::bind(&addr);
-    let server = builder.serve(make_svc);
-    println!("HTTP address: http://{}", server.local_addr());
-
-    server.await.unwrap();
-  });
-
   js_runtime.run_event_loop().await.unwrap();
 
   Ok(())
@@ -172,6 +155,103 @@ pub async fn op_next_request(
   });
 
   Ok(req_json)
+}
+
+#[derive(Default)]
+struct DenoService {
+
+}
+
+impl Service<Request<Body>> for DenoService {
+  type Response = Response<Body>;
+  type Error = http::Error;
+  type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+
+  fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+      // TODO:
+      Poll::Ready(Ok(()))
+  }
+
+  fn call(&mut self, req: Request<Body>) -> Self::Future {
+      // create the body
+      let body: Body = "hello, world!\n"
+          .as_bytes()
+          .to_owned()
+          .into();
+      // Create the HTTP response
+      let resp = Response::builder()
+          .status(StatusCode::OK)
+          .body(body)
+          .expect("Unable to create `http::Response`");
+       
+      // create a response in a future.
+      let fut = async {
+          Ok(resp)
+      };
+
+      // Return the response as an immediate future
+      Box::pin(fut)
+  }
+}
+
+// impl Service for DenoService {
+//   fn poll_ready() {
+//     todo!()
+//   }
+
+//   fn call(&self, req: Request<>) {
+//     let inner = self.inner.lock().unwrap();
+//     inner.request = Some(req);
+//     let response_future = ResponseFuture {
+//       response: None
+//     }.shared();
+//     inner.response_future = response_future.clone();
+//     response_future
+//   }
+// }
+
+struct HttpServer {
+  pub listener: TcpListener,
+}
+
+impl Resource for HttpServer {
+  fn name(&self) -> Cow<str> {
+    "httpServer".into()
+  }
+}
+
+
+pub async fn op_accept(
+  state: Rc<RefCell<OpState>>,
+  value: Value,
+  data: BufVec,
+) -> Result<Value, AnyError> {
+  #[derive(Deserialize)]
+  struct Args {
+    rid: u32,
+  }
+
+  let Args {
+    rid,
+  } = serde_json::from_value(value)?;
+
+  let http_server = state
+    .borrow()
+    .resource_table
+    .get::<HttpServer>(rid)
+    .ok_or_else(bad_resource_id)?;
+  
+  let (tcp_stream, _) = http_server.listener.accept().await?;
+  let deno_service = DenoService::default();
+
+  let hyper_connection = Http::new()
+    .serve_connection(tcp_stream, deno_service);
+
+  let rid = 1;
+
+  Ok(serde_json::json!({
+    "rid": rid,
+  }))
 }
 
 pub fn op_respond(

@@ -5,6 +5,21 @@
     window: globalThis,
   });
 
+  // const server = Deno.httpServer({ port: 8080 });
+
+  // for await (const conn of server) {
+  //   conn.configure({ asdfasdf });
+  //   handleConn(conn)
+  // }
+
+  // async function handleConn(conn) {
+  //   for await (const req of conn) {
+  //     req.respond({
+  //       body: "Hello world!",
+  //     })
+  //   }
+  // }
+
   async function main() {
     while (true) {
       const req = await Deno.core.jsonOpAsync("op_next_request", {});
