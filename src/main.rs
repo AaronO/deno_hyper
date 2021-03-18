@@ -2,16 +2,21 @@ use deno_core::v8;
 
 use std::borrow::Cow;
 use std::cell::RefCell;
-use std::convert::Infallible;
-use std::net::SocketAddr;
+// use std::convert::Infallible;
+// use std::net::SocketAddr;
 use std::pin::Pin;
 use std::rc::Rc;
-use std::str::FromStr;
+// use std::str::FromStr;
+use std::future::Future;
+use std::sync::Arc;
+use std::sync::Mutex;
+use std::task::Context;
+use std::task::Poll;
 
 use deno_core::error::bad_resource_id;
-use deno_core::error::bail;
-use deno_core::error::type_error;
 use deno_core::error::AnyError;
+use deno_core::futures::future::poll_fn;
+use deno_core::futures::FutureExt;
 use deno_core::futures::Stream;
 use deno_core::op_close;
 use deno_core::serde_json;
@@ -28,31 +33,19 @@ use deno_core::RcRef;
 use deno_core::Resource;
 use deno_core::ZeroCopyBuf;
 
-use deno_core::futures::StreamExt;
 use hyper::http;
-use hyper::http::StatusCode;
+use hyper::server::conn::Connection;
 use hyper::server::conn::Http;
-use std::task::Poll;
-use std::task::Context;
-use std::future::Future;
-use hyper::body::HttpBody;
-use hyper::service::make_service_fn;
-use hyper::service::service_fn;
 use hyper::service::Service;
 use hyper::Body;
 use hyper::Request;
 use hyper::Response;
-use hyper::Server;
 use serde::Deserialize;
 use tokio::io::AsyncReadExt;
-use tokio::sync::mpsc;
-use tokio::sync::oneshot;
-use tokio_util::io::StreamReader;
 use tokio::net::TcpListener;
+use tokio_util::io::StreamReader;
 
 const HTTP_ADDR: &str = "127.0.0.1:4000";
-
-pub type RequestAndResponse = (Request<Body>, oneshot::Sender<Response<Body>>);
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), AnyError> {
@@ -61,16 +54,13 @@ async fn main() -> Result<(), AnyError> {
   }
 
   let mut js_runtime = create_js_runtime();
-  let (tx, rx) = mpsc::channel::<RequestAndResponse>(1);
-  let op_state = js_runtime.op_state();
-  let rx = Rc::new(RefCell::new(rx));
-  op_state.borrow_mut().put(rx);
 
   js_runtime
     .execute("bootstrap.js", include_str!("bootstrap.js"))
     .unwrap();
 
   let script = tokio::fs::read_to_string("mod.js").await.unwrap();
+
   js_runtime.execute("mod.js", &script).unwrap();
   js_runtime.run_event_loop().await.unwrap();
 
@@ -79,136 +69,127 @@ async fn main() -> Result<(), AnyError> {
 
 fn create_js_runtime() -> JsRuntime {
   let mut js_runtime = JsRuntime::new(Default::default());
+  js_runtime.register_op(
+    "op_create_server",
+    deno_core::json_op_async(op_create_server),
+  );
+  js_runtime.register_op("op_accept", deno_core::json_op_async(op_accept));
   js_runtime
     .register_op("op_next_request", deno_core::json_op_async(op_next_request));
   js_runtime.register_op("op_respond", deno_core::json_op_sync(op_respond));
-  js_runtime
-    .register_op("op_request_read", deno_core::json_op_async(op_request_read));
-  js_runtime.register_op(
-    "op_response_write",
-    deno_core::json_op_async(op_response_write),
-  );
+  // js_runtime
+  //   .register_op("op_request_read", deno_core::json_op_async(op_request_read));
+  // js_runtime.register_op(
+  //   "op_response_write",
+  //   deno_core::json_op_async(op_response_write),
+  // );
   js_runtime.register_op("op_close", deno_core::json_op_sync(op_close));
   js_runtime
 }
 
-#[allow(clippy::await_holding_refcell_ref)]
 pub async fn op_next_request(
   state: Rc<RefCell<OpState>>,
-  _args: Value,
+  value: Value,
   _data: BufVec,
 ) -> Result<Value, AnyError> {
-  let rx = state
-    .borrow()
-    .borrow::<Rc<RefCell<mpsc::Receiver<RequestAndResponse>>>>()
-    .clone();
-  let (req, tx) = match rx.borrow_mut().recv().await {
-    None => bail!("failed to recieve"),
-    Some(v) => v,
-  };
-
-  let method = req.method().to_string();
-
-  let mut headers = Vec::with_capacity(req.headers().len());
-
-  for (name, value) in req.headers().iter() {
-    let name = name.to_string();
-    let value = value.to_str().unwrap_or("").to_string();
-    headers.push((name, value));
+  #[derive(Deserialize)]
+  struct Args {
+    rid: u32,
   }
 
-  let host = extract_host(&req).expect("HTTP request without Host header");
-  let path = req.uri().path_and_query().unwrap();
-  let url = format!("https://{}{}", host, path);
+  let Args { rid } = serde_json::from_value(value)?;
 
-  let has_body = if let Some(exact_size) = req.size_hint().exact() {
-    exact_size > 0
-  } else {
-    true
-  };
+  let conn_resource = state
+    .borrow()
+    .resource_table
+    .get::<ConnResource>(rid)
+    .ok_or_else(bad_resource_id)?;
 
-  let maybe_request_body_rid = if has_body {
-    let stream: BytesStream = Box::pin(req.into_body().map(|r| {
-      r.map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, err))
-    }));
-    let stream_reader = StreamReader::new(stream);
-    let mut state = state.borrow_mut();
-    let request_body_rid = state.resource_table.add(RequestBodyResource {
-      reader: AsyncRefCell::new(stream_reader),
-      cancel: CancelHandle::default(),
-    });
-    Some(request_body_rid)
-  } else {
-    None
-  };
+  poll_fn(|cx| {
+    let _ = conn_resource.hyper_connection.borrow_mut().poll_unpin(cx);
 
-  let mut state = state.borrow_mut();
-  let response_sender_rid =
-    state.resource_table.add(ResponseSenderResource(tx));
+    if let Some(req) = conn_resource
+      .deno_service
+      .inner
+      .lock()
+      .unwrap()
+      .request
+      .take()
+    {
+      let method = req.method().to_string();
 
-  let req_json = json!({
-    "requestBodyRid": maybe_request_body_rid,
-    "responseSenderRid": response_sender_rid,
-    "method": method,
-    "headers": headers,
-    "url": url,
-  });
+      let mut headers = Vec::with_capacity(req.headers().len());
 
-  Ok(req_json)
+      for (name, value) in req.headers().iter() {
+        let name = name.to_string();
+        let value = value.to_str().unwrap_or("").to_string();
+        headers.push((name, value));
+      }
+
+      let host = extract_host(&req).expect("HTTP request without Host header");
+      let path = req.uri().path_and_query().unwrap();
+      let url = format!("https://{}{}", host, path);
+
+      let req_json = json!({
+        "method": method,
+        "headers": headers,
+        "url": url,
+      });
+
+      return Poll::Ready(Ok(req_json));
+    }
+
+    Poll::Pending
+  })
+  .await
 }
 
 #[derive(Default)]
-struct DenoService {
+struct DenoServiceInner {
+  request: Option<Request<Body>>,
+  response: Option<Response<Body>>,
+}
 
+#[derive(Clone, Default)]
+struct DenoService {
+  inner: Arc<Mutex<DenoServiceInner>>,
+  // waker: Waker,
 }
 
 impl Service<Request<Body>> for DenoService {
   type Response = Response<Body>;
   type Error = http::Error;
-  type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+  type Future =
+    Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
 
-  fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-      // TODO:
-      Poll::Ready(Ok(()))
+  fn poll_ready(
+    &mut self,
+    _cx: &mut Context<'_>,
+  ) -> Poll<Result<(), Self::Error>> {
+    // TODO:
+    Poll::Ready(Ok(()))
   }
 
   fn call(&mut self, req: Request<Body>) -> Self::Future {
-      // create the body
-      let body: Body = "hello, world!\n"
-          .as_bytes()
-          .to_owned()
-          .into();
-      // Create the HTTP response
-      let resp = Response::builder()
-          .status(StatusCode::OK)
-          .body(body)
-          .expect("Unable to create `http::Response`");
-       
-      // create a response in a future.
-      let fut = async {
-          Ok(resp)
-      };
+    {
+      let mut inner = self.inner.lock().unwrap();
+      inner.request = Some(req);
+    }
 
-      // Return the response as an immediate future
-      Box::pin(fut)
+    let inner = self.inner.clone();
+
+    poll_fn(move |_cx| {
+      // self.waker = cx.waker().clone();
+      let inner = inner.clone();
+      let mut guard = inner.lock().unwrap();
+      if let Some(response) = guard.response.take() {
+        return Poll::Ready(Ok(response));
+      }
+      Poll::Pending
+    })
+    .boxed()
   }
 }
-
-// impl Service for DenoService {
-//   fn poll_ready() {
-//     todo!()
-//   }
-
-//   fn call(&self, req: Request<>) {
-//     let inner = self.inner.lock().unwrap();
-//     inner.request = Some(req);
-//     let response_future = ResponseFuture {
-//       response: None
-//     }.shared();
-//     inner.response_future = response_future.clone();
-//     response_future
-//   }
-// }
 
 struct HttpServer {
   pub listener: TcpListener,
@@ -220,34 +201,65 @@ impl Resource for HttpServer {
   }
 }
 
+struct ConnResource {
+  pub hyper_connection:
+    Rc<RefCell<Connection<tokio::net::TcpStream, DenoService>>>,
+  pub deno_service: DenoService,
+}
+
+impl Resource for ConnResource {
+  fn name(&self) -> Cow<str> {
+    "httpConnection".into()
+  }
+}
+
+pub async fn op_create_server(
+  state: Rc<RefCell<OpState>>,
+  _value: Value,
+  _data: BufVec,
+) -> Result<Value, AnyError> {
+  // TODO: handle address
+  let tcp_listener = TcpListener::bind(HTTP_ADDR).await.unwrap();
+  let http_server = HttpServer {
+    listener: tcp_listener,
+  };
+
+  let rid = state.borrow_mut().resource_table.add(http_server);
+
+  Ok(serde_json::json!({
+    "rid": rid,
+  }))
+}
 
 pub async fn op_accept(
   state: Rc<RefCell<OpState>>,
   value: Value,
-  data: BufVec,
+  _data: BufVec,
 ) -> Result<Value, AnyError> {
   #[derive(Deserialize)]
   struct Args {
     rid: u32,
   }
 
-  let Args {
-    rid,
-  } = serde_json::from_value(value)?;
+  let Args { rid } = serde_json::from_value(value)?;
 
   let http_server = state
     .borrow()
     .resource_table
     .get::<HttpServer>(rid)
     .ok_or_else(bad_resource_id)?;
-  
+
   let (tcp_stream, _) = http_server.listener.accept().await?;
   let deno_service = DenoService::default();
 
-  let hyper_connection = Http::new()
-    .serve_connection(tcp_stream, deno_service);
+  let hyper_connection =
+    Http::new().serve_connection(tcp_stream, deno_service.clone());
 
-  let rid = 1;
+  let conn_resource = ConnResource {
+    hyper_connection: Rc::new(RefCell::new(hyper_connection)),
+    deno_service,
+  };
+  let rid = state.borrow_mut().resource_table.add(conn_resource);
 
   Ok(serde_json::json!({
     "rid": rid,
@@ -257,7 +269,7 @@ pub async fn op_accept(
 pub fn op_respond(
   state: &mut OpState,
   value: Value,
-  data: &mut [ZeroCopyBuf],
+  _data: &mut [ZeroCopyBuf],
 ) -> Result<Value, AnyError> {
   #[derive(Deserialize)]
   struct Args {
@@ -272,54 +284,25 @@ pub fn op_respond(
     headers,
   } = serde_json::from_value(value)?;
 
-  let response_sender = state
+  let conn_resource = state
     .resource_table
-    .take::<ResponseSenderResource>(rid)
+    .get::<ConnResource>(rid)
     .ok_or_else(bad_resource_id)?;
-  let response_sender = Rc::try_unwrap(response_sender)
-    .ok()
-    .expect("multiple op_respond ongoing");
 
-  let mut builder = Response::builder().status(status);
+  {
+    let mut deno_service = conn_resource.deno_service.inner.lock().unwrap();
+    let mut builder = Response::builder().status(status);
 
-  for (name, value) in headers {
-    builder = builder.header(&name, &value);
-  }
-
-  let res;
-  let maybe_response_body_rid = match data.len() {
-    0 => {
-      // If no body is passed, we return a writer for streaming the body.
-      let (sender, body) = Body::channel();
-      res = builder.body(body)?;
-
-      let response_body_rid =
-        state.resource_table.add(DyperResponseBodyResource {
-          body: AsyncRefCell::new(sender),
-          cancel: CancelHandle::default(),
-        });
-
-      Some(response_body_rid)
+    for (name, value) in headers {
+      builder = builder.header(&name, &value);
     }
-    1 => {
-      // If a body is passed, we use it, and don't return a body for streaming.
-      res = builder.body(Vec::from(&*data[0]).into())?;
-      None
-    }
-    _ => panic!("Invalid number of arguments"),
-  };
+    let response = builder.body(Body::from("hello world"))?;
 
-  // oneshot::Sender::send(v) returns |v| on error, not an error object.
-  // The only failure mode is the receiver already having dropped its end
-  // of the channel.
-  if response_sender.0.send(res).is_err() {
-    eprintln!("op_respond: receiver dropped");
-    return Err(type_error("internal communication error"));
+    deno_service.response = Some(response);
   }
+  // conn_resource.deno_service.waker.wake();
 
-  Ok(serde_json::json!({
-    "responseBodyRid": maybe_response_body_rid
-  }))
+  Ok(json!({}))
 }
 
 pub async fn op_request_read(
@@ -394,14 +377,6 @@ struct RequestBodyResource {
 impl Resource for RequestBodyResource {
   fn name(&self) -> Cow<str> {
     "requestBody".into()
-  }
-}
-
-struct ResponseSenderResource(oneshot::Sender<Response<Body>>);
-
-impl Resource for ResponseSenderResource {
-  fn name(&self) -> Cow<str> {
-    "responseSender".into()
   }
 }
 
