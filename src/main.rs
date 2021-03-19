@@ -12,6 +12,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::task::Context;
 use std::task::Poll;
+use std::task::Waker;
 
 use deno_core::error::bad_resource_id;
 use deno_core::error::AnyError;
@@ -106,6 +107,7 @@ pub async fn op_next_request(
     .ok_or_else(bad_resource_id)?;
 
   poll_fn(|cx| {
+    // TODO: error is swallowed and when connection shutdowns we continue going
     let _ = conn_resource.hyper_connection.borrow_mut().poll_unpin(cx);
 
     if let Some(req) = conn_resource
@@ -153,7 +155,7 @@ struct DenoServiceInner {
 #[derive(Clone, Default)]
 struct DenoService {
   inner: Arc<Mutex<DenoServiceInner>>,
-  // waker: Waker,
+  waker: Option<Waker>,
 }
 
 impl Service<Request<Body>> for DenoService {
@@ -178,8 +180,10 @@ impl Service<Request<Body>> for DenoService {
 
     let inner = self.inner.clone();
 
-    poll_fn(move |_cx| {
-      // self.waker = cx.waker().clone();
+    let mut self_ = self.clone();
+    poll_fn(move |cx| {
+      // eprintln!("attach waker");
+      self_.waker = Some(cx.waker().clone());
       let inner = inner.clone();
       let mut guard = inner.lock().unwrap();
       if let Some(response) = guard.response.take() {
@@ -300,7 +304,9 @@ pub fn op_respond(
 
     deno_service.response = Some(response);
   }
-  // conn_resource.deno_service.waker.wake();
+  if let Some(waker) = conn_resource.deno_service.waker.as_ref() {
+    waker.wake_by_ref();
+  }
 
   Ok(json!({}))
 }
