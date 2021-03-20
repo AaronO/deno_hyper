@@ -20,19 +20,16 @@ use deno_core::futures::future::poll_fn;
 use deno_core::futures::FutureExt;
 use deno_core::futures::Stream;
 use deno_core::op_close;
-use deno_core::serde_json;
-use deno_core::serde_json::json;
-use deno_core::serde_json::Value;
 use deno_core::AsyncRefCell;
-use deno_core::BufVec;
 use deno_core::CancelFuture;
 use deno_core::CancelHandle;
 use deno_core::CancelTryFuture;
 use deno_core::JsRuntime;
 use deno_core::OpState;
+use deno_core::OpBuf;
 use deno_core::RcRef;
 use deno_core::Resource;
-use deno_core::ZeroCopyBuf;
+use deno_core::ResourceId;
 
 use hyper::http;
 use hyper::server::conn::Connection;
@@ -42,6 +39,7 @@ use hyper::Body;
 use hyper::Request;
 use hyper::Response;
 use serde::Deserialize;
+use serde::Serialize;
 use tokio::io::AsyncReadExt;
 use tokio::net::TcpListener;
 use tokio_util::io::StreamReader;
@@ -88,18 +86,18 @@ fn create_js_runtime() -> JsRuntime {
   js_runtime
 }
 
+#[derive(Serialize)]
+pub struct NextRequest {
+  pub method: String,
+  pub headers: Vec<(String, String)>,
+  pub url: String,
+}
+
 pub async fn op_next_request(
   state: Rc<RefCell<OpState>>,
-  value: Value,
-  _data: BufVec,
-) -> Result<Value, AnyError> {
-  #[derive(Deserialize)]
-  struct Args {
-    rid: u32,
-  }
-
-  let Args { rid } = serde_json::from_value(value)?;
-
+  rid: ResourceId,
+  _data: OpBuf,
+) -> Result<NextRequest, AnyError> {
   let conn_resource = state
     .borrow()
     .resource_table
@@ -132,11 +130,11 @@ pub async fn op_next_request(
       let path = req.uri().path_and_query().unwrap();
       let url = format!("https://{}{}", host, path);
 
-      let req_json = json!({
-        "method": method,
-        "headers": headers,
-        "url": url,
-      });
+      let req_json = NextRequest{
+        method,
+        headers,
+        url,
+      };
 
       return Poll::Ready(Ok(req_json));
     }
@@ -219,9 +217,9 @@ impl Resource for ConnResource {
 
 pub async fn op_create_server(
   state: Rc<RefCell<OpState>>,
-  _value: Value,
-  _data: BufVec,
-) -> Result<Value, AnyError> {
+  _value: (),
+  _data: OpBuf,
+) -> Result<ResourceId, AnyError> {
   // TODO: handle address
   let tcp_listener = TcpListener::bind(HTTP_ADDR).await.unwrap();
   let http_server = HttpServer {
@@ -230,22 +228,14 @@ pub async fn op_create_server(
 
   let rid = state.borrow_mut().resource_table.add(http_server);
 
-  Ok(serde_json::json!({
-    "rid": rid,
-  }))
+  Ok(rid)
 }
 
 pub async fn op_accept(
   state: Rc<RefCell<OpState>>,
-  value: Value,
-  _data: BufVec,
-) -> Result<Value, AnyError> {
-  #[derive(Deserialize)]
-  struct Args {
-    rid: u32,
-  }
-
-  let Args { rid } = serde_json::from_value(value)?;
+  rid: ResourceId,
+  _data: OpBuf,
+) -> Result<ResourceId, AnyError> {
 
   let http_server = state
     .borrow()
@@ -265,28 +255,28 @@ pub async fn op_accept(
   };
   let rid = state.borrow_mut().resource_table.add(conn_resource);
 
-  Ok(serde_json::json!({
-    "rid": rid,
-  }))
+  Ok(rid)
+}
+
+
+#[derive(Deserialize)]
+pub struct RespondArgs {
+  pub rid: u32,
+  pub status: u16,
+  pub headers: Vec<(String, String)>,
 }
 
 pub fn op_respond(
   state: &mut OpState,
-  value: Value,
-  _data: &mut [ZeroCopyBuf],
-) -> Result<Value, AnyError> {
-  #[derive(Deserialize)]
-  struct Args {
-    rid: u32,
-    status: u16,
-    headers: Vec<(String, String)>,
-  }
+  args: RespondArgs,
+  _data: OpBuf,
+) -> Result<(), AnyError> {
 
-  let Args {
+  let RespondArgs {
     rid,
     status,
     headers,
-  } = serde_json::from_value(value)?;
+  } = args;
 
   let conn_resource = state
     .resource_table
@@ -308,26 +298,18 @@ pub fn op_respond(
     waker.wake_by_ref();
   }
 
-  Ok(json!({}))
+  Ok(())
 }
 
 pub async fn op_request_read(
   state: Rc<RefCell<OpState>>,
-  args: Value,
-  data: BufVec,
-) -> Result<Value, AnyError> {
-  #[derive(Deserialize)]
-  #[serde(rename_all = "camelCase")]
-  struct Args {
-    rid: u32,
-  }
-
-  let args: Args = serde_json::from_value(args)?;
-  let rid = args.rid;
-
-  if data.len() != 1 {
+  rid: ResourceId,
+  data: OpBuf,
+) -> Result<usize, AnyError> {
+  if data.is_none() {
     panic!("Invalid number of arguments");
   }
+  let data = data.unwrap();
 
   let resource = state
     .borrow()
@@ -336,28 +318,19 @@ pub async fn op_request_read(
     .ok_or_else(bad_resource_id)?;
   let mut reader = RcRef::map(&resource, |r| &r.reader).borrow_mut().await;
   let cancel = RcRef::map(resource, |r| &r.cancel);
-  let mut buf = data[0].clone();
+  let mut buf = data.clone();
   let read = reader.read(&mut buf).try_or_cancel(cancel).await?;
-  Ok(json!({ "read": read }))
+  Ok(read)
 }
 
 pub async fn op_response_write(
   state: Rc<RefCell<OpState>>,
-  args: Value,
-  data: BufVec,
-) -> Result<Value, AnyError> {
-  #[derive(Deserialize)]
-  #[serde(rename_all = "camelCase")]
-  struct Args {
-    rid: u32,
-  }
-
-  let args: Args = serde_json::from_value(args)?;
-  let rid = args.rid;
-
-  let buf = match data.len() {
-    1 => Vec::from(&*data[0]),
-    _ => panic!("Invalid number of arguments"),
+  rid: ResourceId,
+  data: OpBuf,
+) -> Result<(), AnyError> {
+  let buf = match data {
+    Some(buf) => Vec::from(&*buf),
+    None => panic!("Invalid number of arguments"),
   };
 
   let resource = state
@@ -369,7 +342,7 @@ pub async fn op_response_write(
   let cancel = RcRef::map(resource, |r| &r.cancel);
   body.send_data(buf.into()).or_cancel(cancel).await??;
 
-  Ok(json!({}))
+  Ok(())
 }
 
 type BytesStream =

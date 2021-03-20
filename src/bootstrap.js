@@ -8,9 +8,7 @@
 
   async function handleConn(connRid) {
     while (true) {
-      const request = await Deno.core.jsonOpAsync("op_next_request", {
-        rid: connRid,
-      });
+      const request = await Deno.core.jsonOpAsync("op_next_request", connRid);
       // Deno.core.print(`request ${JSON.stringify(request)}\n`);
       Deno.core.jsonOpSync("op_respond", {
         rid: connRid,
@@ -21,16 +19,14 @@
   }
 
   async function main() {
-    const { rid: serverRid } = await Deno.core.jsonOpAsync(
+    const serverRid = await Deno.core.jsonOpAsync(
       "op_create_server",
-      {},
+      null,
     );
     // Deno.core.print(`server rid ${serverRid}\n`);
 
     while (true) {
-      const { rid: connRid } = await Deno.core.jsonOpAsync("op_accept", {
-        rid: serverRid,
-      });
+      const connRid = await Deno.core.jsonOpAsync("op_accept", serverRid);
       // Deno.core.print(`conn rid ${connRid}\n`);
       handleConn(connRid);
     }
