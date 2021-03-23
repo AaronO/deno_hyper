@@ -19,11 +19,12 @@ use deno_core::error::AnyError;
 use deno_core::futures::future::poll_fn;
 use deno_core::futures::FutureExt;
 use deno_core::op_close;
-use deno_core::ResourceId;
+use deno_core::serde_json::json;
 use deno_core::BufVec;
 use deno_core::JsRuntime;
 use deno_core::OpState;
 use deno_core::Resource;
+use deno_core::ResourceId;
 use deno_core::ZeroCopyBuf;
 
 use hyper::http;
@@ -46,7 +47,7 @@ async fn main() -> Result<(), AnyError> {
   let mut js_runtime = create_js_runtime();
 
   js_runtime
-    .execute("bootstrap.js", include_str!("bootstrap.js"))
+    .execute("bootstrap_bin.js", include_str!("bootstrap_bin.js"))
     .unwrap();
 
   let script = tokio::fs::read_to_string("mod.js").await.unwrap();
@@ -67,12 +68,6 @@ fn create_js_runtime() -> JsRuntime {
   js_runtime
     .register_op("op_next_request", deno_core::bin_op_async(op_next_request));
   js_runtime.register_op("op_respond", deno_core::bin_op_sync(op_respond));
-  // js_runtime
-  //   .register_op("op_request_read", deno_core::bin_op_async(op_request_read));
-  // js_runtime.register_op(
-  //   "op_response_write",
-  //   deno_core::bin_op_async(op_response_write),
-  // );
   js_runtime.register_op("op_close", deno_core::json_op_sync(op_close));
   js_runtime
 }
@@ -92,7 +87,7 @@ pub async fn op_next_request(
     // TODO: error is swallowed and when connection shutdowns we continue going
     let _ = conn_resource.hyper_connection.borrow_mut().poll_unpin(cx);
 
-    if let Some(_req) = conn_resource
+    if let Some(req) = conn_resource
       .deno_service
       .inner
       .lock()
@@ -100,25 +95,25 @@ pub async fn op_next_request(
       .request
       .take()
     {
-      // let method = req.method().to_string();
+      let method = req.method().to_string();
 
-      // let mut headers = Vec::with_capacity(req.headers().len());
+      let mut headers = Vec::with_capacity(req.headers().len());
 
-      // for (name, value) in req.headers().iter() {
-      //   let name = name.to_string();
-      //   let value = value.to_str().unwrap_or("").to_string();
-      //   headers.push((name, value));
-      // }
+      for (name, value) in req.headers().iter() {
+        let name = name.to_string();
+        let value = value.to_str().unwrap_or("").to_string();
+        headers.push((name, value));
+      }
 
-      // let host = extract_host(&req).expect("HTTP request without Host header");
-      // let path = req.uri().path_and_query().unwrap();
-      // let url = format!("https://{}{}", host, path);
+      let host = extract_host(&req).expect("HTTP request without Host header");
+      let path = req.uri().path_and_query().unwrap();
+      let url = format!("https://{}{}", host, path);
 
-      // let req_json = json!({
-      //   "method": method,
-      //   "headers": headers,
-      //   "url": url,
-      // });
+      let _req_json = json!({
+        "method": method,
+        "headers": headers,
+        "url": url,
+      });
 
       return Poll::Ready(Ok(0));
     }
@@ -267,4 +262,23 @@ pub fn op_respond(
   }
 
   Ok(0)
+}
+
+fn extract_host(req: &Request<Body>) -> Option<String> {
+  if req.version() == hyper::Version::HTTP_2 {
+    req.uri().host().map(|s| {
+      format!(
+        "{}{}",
+        s,
+        if let Some(port) = req.uri().port_u16() {
+          format!(":{}", port)
+        } else {
+          "".to_string()
+        }
+      )
+    })
+  } else {
+    let host_header = req.headers().get(hyper::header::HOST)?;
+    Some(host_header.to_str().ok()?.to_string())
+  }
 }
