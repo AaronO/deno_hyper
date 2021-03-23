@@ -72,7 +72,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "dyper_ops"
+name = "deno_hyper"
 version = "0.1.0"
 dependencies = [
  "bytes",

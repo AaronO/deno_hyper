@@ -18,19 +18,13 @@ use deno_core::error::bad_resource_id;
 use deno_core::error::AnyError;
 use deno_core::futures::future::poll_fn;
 use deno_core::futures::FutureExt;
-use deno_core::futures::Stream;
 use deno_core::op_close;
 use deno_core::serde_json;
 use deno_core::serde_json::json;
 use deno_core::serde_json::Value;
-use deno_core::AsyncRefCell;
 use deno_core::BufVec;
-use deno_core::CancelFuture;
-use deno_core::CancelHandle;
-use deno_core::CancelTryFuture;
 use deno_core::JsRuntime;
 use deno_core::OpState;
-use deno_core::RcRef;
 use deno_core::Resource;
 use deno_core::ZeroCopyBuf;
 
@@ -42,9 +36,7 @@ use hyper::Body;
 use hyper::Request;
 use hyper::Response;
 use serde::Deserialize;
-use tokio::io::AsyncReadExt;
 use tokio::net::TcpListener;
-use tokio_util::io::StreamReader;
 
 const HTTP_ADDR: &str = "127.0.0.1:4000";
 
@@ -60,9 +52,6 @@ async fn main() -> Result<(), AnyError> {
     .execute("bootstrap.js", include_str!("bootstrap.js"))
     .unwrap();
 
-  let script = tokio::fs::read_to_string("mod.js").await.unwrap();
-
-  js_runtime.execute("mod.js", &script).unwrap();
   js_runtime.run_event_loop().await.unwrap();
 
   Ok(())
@@ -78,12 +67,6 @@ fn create_js_runtime() -> JsRuntime {
   js_runtime
     .register_op("op_next_request", deno_core::json_op_async(op_next_request));
   js_runtime.register_op("op_respond", deno_core::json_op_sync(op_respond));
-  // js_runtime
-  //   .register_op("op_request_read", deno_core::json_op_async(op_request_read));
-  // js_runtime.register_op(
-  //   "op_response_write",
-  //   deno_core::json_op_async(op_response_write),
-  // );
   js_runtime.register_op("op_close", deno_core::json_op_sync(op_close));
   js_runtime
 }
@@ -182,8 +165,10 @@ impl Service<Request<Body>> for DenoService {
 
     let mut self_ = self.clone();
     poll_fn(move |cx| {
-      // eprintln!("attach waker");
-      self_.waker = Some(cx.waker().clone());
+      if self_.waker.is_none() {
+        // eprintln!("attach waker");
+        self_.waker = Some(cx.waker().clone());
+      }
       let inner = inner.clone();
       let mut guard = inner.lock().unwrap();
       if let Some(response) = guard.response.take() {
@@ -309,92 +294,6 @@ pub fn op_respond(
   }
 
   Ok(json!({}))
-}
-
-pub async fn op_request_read(
-  state: Rc<RefCell<OpState>>,
-  args: Value,
-  data: BufVec,
-) -> Result<Value, AnyError> {
-  #[derive(Deserialize)]
-  #[serde(rename_all = "camelCase")]
-  struct Args {
-    rid: u32,
-  }
-
-  let args: Args = serde_json::from_value(args)?;
-  let rid = args.rid;
-
-  if data.len() != 1 {
-    panic!("Invalid number of arguments");
-  }
-
-  let resource = state
-    .borrow()
-    .resource_table
-    .get::<RequestBodyResource>(rid as u32)
-    .ok_or_else(bad_resource_id)?;
-  let mut reader = RcRef::map(&resource, |r| &r.reader).borrow_mut().await;
-  let cancel = RcRef::map(resource, |r| &r.cancel);
-  let mut buf = data[0].clone();
-  let read = reader.read(&mut buf).try_or_cancel(cancel).await?;
-  Ok(json!({ "read": read }))
-}
-
-pub async fn op_response_write(
-  state: Rc<RefCell<OpState>>,
-  args: Value,
-  data: BufVec,
-) -> Result<Value, AnyError> {
-  #[derive(Deserialize)]
-  #[serde(rename_all = "camelCase")]
-  struct Args {
-    rid: u32,
-  }
-
-  let args: Args = serde_json::from_value(args)?;
-  let rid = args.rid;
-
-  let buf = match data.len() {
-    1 => Vec::from(&*data[0]),
-    _ => panic!("Invalid number of arguments"),
-  };
-
-  let resource = state
-    .borrow()
-    .resource_table
-    .get::<DyperResponseBodyResource>(rid as u32)
-    .ok_or_else(bad_resource_id)?;
-  let mut body = RcRef::map(&resource, |r| &r.body).borrow_mut().await;
-  let cancel = RcRef::map(resource, |r| &r.cancel);
-  body.send_data(buf.into()).or_cancel(cancel).await??;
-
-  Ok(json!({}))
-}
-
-type BytesStream =
-  Pin<Box<dyn Stream<Item = Result<bytes::Bytes, std::io::Error>> + Unpin>>;
-
-struct RequestBodyResource {
-  reader: AsyncRefCell<StreamReader<BytesStream, bytes::Bytes>>,
-  cancel: CancelHandle,
-}
-
-impl Resource for RequestBodyResource {
-  fn name(&self) -> Cow<str> {
-    "requestBody".into()
-  }
-}
-
-struct DyperResponseBodyResource {
-  body: AsyncRefCell<hyper::body::Sender>,
-  cancel: CancelHandle,
-}
-
-impl Resource for DyperResponseBodyResource {
-  fn name(&self) -> Cow<str> {
-    "requestBody".into()
-  }
 }
 
 fn extract_host(req: &Request<Body>) -> Option<String> {

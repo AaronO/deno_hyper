@@ -1,5 +1,5 @@
 [package]
-name = "dyper_ops"
+name = "deno_hyper"
 version = "0.1.0"
 authors = ["Luca Casonato <lucacasonato@yahoo.com>"]
 edition = "2018"
